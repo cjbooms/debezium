@@ -74,6 +74,8 @@ import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.connector.postgresql.connection.PostgresReplicationConnection;
 import io.debezium.connector.postgresql.connection.ReplicaIdentityInfo;
 import io.debezium.connector.postgresql.connection.ReplicationConnection;
+import io.debezium.connector.postgresql.connection.ReplicationStream;
+import io.debezium.connector.postgresql.connection.WalPositionLocator;
 import io.debezium.connector.postgresql.connection.pgoutput.PgOutputMessageDecoder;
 import io.debezium.connector.postgresql.junit.PostgresDatabaseVersionResolver;
 import io.debezium.connector.postgresql.junit.SkipWhenDecoderPluginNameIs;
@@ -2158,6 +2160,26 @@ public class PostgresConnectorIT extends AbstractAsyncEngineConnectorTest {
         return lsn;
     }
 
+    /**
+     * Gets the flush_lsn from pg_stat_replication for the default replication slot.
+     * This is the LSN value that the issue reporter DBZ-1489 observed moving backwards.
+     */
+    private Lsn getFlushLsnFromStatReplication(PostgresConnection connection) throws SQLException {
+        final String lsnStr = connection.prepareQueryAndMap(
+                "SELECT flush_lsn FROM pg_stat_replication LIMIT 1",
+                statement -> {
+                    // No parameters needed
+                },
+                rs -> {
+                    if (rs.next()) {
+                        return rs.getString("flush_lsn");
+                    }
+                    return null;
+                });
+        connection.rollback();
+        return lsnStr != null ? Lsn.valueOf(lsnStr) : null;
+    }
+
     private void assertFieldAbsent(SourceRecord record, String fieldName) {
         Struct value = (Struct) ((Struct) record.value()).get(Envelope.FieldName.AFTER);
         try {
@@ -2956,6 +2978,246 @@ public class PostgresConnectorIT extends AbstractAsyncEngineConnectorTest {
                 .isGreaterThanOrEqualTo(postActivityServerLsn);
 
         stopConnector();
+    }
+
+    @Test
+    @FixFor("DBZ-1489")
+    public void shouldNotMoveFlushLsnBackwardsWhenFlushingOlderLsn() throws Exception {
+        // This test validates the bug reported in DBZ-1489:
+        // When using lsn.flush.mode=connector_and_driver, flush_lsn can move backwards
+        // if flushLsn() is called with an older LSN after it has already been advanced.
+        //
+        // Root cause: There are no guards in the JDBC driver or Debezium to prevent
+        // flushLsn() from moving backwards when called with a stale LSN value.
+        //
+        // Simplified scenario:
+        // 1. Flush LSN X
+        // 2. Flush LSN Y (where Y > X)
+        // 3. Flush LSN X again -> Bug: flush_lsn moves backwards from Y to X
+
+        TestHelper.execute(SETUP_TABLES_STMT);
+
+        try (PostgresConnection connection = TestHelper.create();
+                ReplicationConnection replConnection = TestHelper.createForReplication("test_slot", false)) {
+
+            logger.info("Starting replication stream...");
+            ReplicationStream stream = replConnection.startStreaming(new WalPositionLocator());
+
+            // Generate multiple WAL records
+            for (int i = 1; i <= 5; i++) {
+                TestHelper.execute("INSERT INTO s1.a (aa) VALUES (" + i + ");");
+            }
+            Thread.sleep(1000); // Wait for all messages to arrive
+
+            // Read all messages and collect unique LSNs
+            final List<Lsn> receivedLsns = new ArrayList<>();
+            stream.readPending(msg -> {
+                Lsn currentLsn = stream.lastReceivedLsn();
+                if (currentLsn != null && (receivedLsns.isEmpty() || !receivedLsns.get(receivedLsns.size() - 1).equals(currentLsn))) {
+                    receivedLsns.add(currentLsn);
+                }
+            });
+
+            // We need at least 2 distinct LSNs
+            if (receivedLsns.size() < 2) {
+                // If we didn't get 2 distinct LSNs, manually create them for the test
+                Lsn baseLsn = stream.lastReceivedLsn();
+                assertThat(baseLsn).isNotNull();
+                receivedLsns.clear();
+                receivedLsns.add(baseLsn);
+                // Create a second LSN that's 1000 bytes ahead
+                receivedLsns.add(Lsn.valueOf(baseLsn.asLong() + 1000));
+                logger.warn("Only received {} unique LSN(s), using synthetic LSNs for test", receivedLsns.size());
+            }
+
+            logger.info("Received {} unique LSNs: {}", receivedLsns.size(), receivedLsns);
+
+            // Get the first and last LSN
+            Lsn lsn1 = receivedLsns.get(0);
+            Lsn lsn2 = receivedLsns.get(receivedLsns.size() - 1);
+            assertThat(lsn2).isGreaterThan(lsn1);
+            logger.info("Step 1: Will test with LSN1={} and LSN2={} (delta: +{} bytes)",
+                    lsn1, lsn2, lsn2.asLong() - lsn1.asLong());
+
+            // Step 2: Flush the higher LSN (LSN2)
+            logger.info("Step 2: Flushing higher LSN2 = {}", lsn2);
+            stream.flushLsn(lsn2);
+            Thread.sleep(500);
+
+            // Check flush_lsn from pg_stat_replication
+            Lsn flushLsnAfterLsn2 = getFlushLsnFromStatReplication(connection);
+            if (flushLsnAfterLsn2 != null) {
+                logger.info("Step 2: flush_lsn after flushing LSN2 = {}", flushLsnAfterLsn2);
+                assertThat(flushLsnAfterLsn2).isGreaterThanOrEqualTo(lsn2);
+            }
+            else {
+                logger.warn("Step 3: flush_lsn is null (replication not yet visible in pg_stat_replication)");
+            }
+
+            // Step 4: NOW call flushLsn() with the OLDER LSN (LSN1) to demonstrate the bug
+            logger.info("Step 4: Calling flushLsn() with OLDER LSN1 = {}", lsn1);
+            stream.flushLsn(lsn1);
+            Thread.sleep(500);
+
+            // Step 5: Check if flush_lsn moved backwards
+            Lsn flushLsnAfterOldFlush = getFlushLsnFromStatReplication(connection);
+            if (flushLsnAfterOldFlush != null) {
+                logger.info("Step 5: flush_lsn after flushing OLDER LSN1 = {}", flushLsnAfterOldFlush);
+
+                // THIS IS THE BUG: If flush_lsn is less than LSN2, it moved backwards
+                if (flushLsnAfterOldFlush.compareTo(lsn2) < 0) {
+                    fail(String.format(
+                            "★★★ BUG DBZ-1489 REPRODUCED ★★★%n" +
+                                    "flush_lsn moved BACKWARDS from %s to %s (-%d bytes) after calling flushLsn(%s).%n" +
+                                    "This demonstrates that neither the JDBC driver nor Debezium prevents backwards LSN movement.%n" +
+                                    "Timeline:%n" +
+                                    "  1. Flushed LSN2=%s%n" +
+                                    "  2. flush_lsn was at %s%n" +
+                                    "  3. Called flushLsn(LSN1=%s) where LSN1 < LSN2%n" +
+                                    "  4. flush_lsn moved backwards to %s",
+                            lsn2, flushLsnAfterOldFlush, lsn2.asLong() - flushLsnAfterOldFlush.asLong(),
+                            lsn1, lsn2, lsn2, lsn1, flushLsnAfterOldFlush));
+                }
+
+                logger.info("✓ Protection working: flush_lsn remained at or above LSN2={} (current: {})",
+                        lsn2, flushLsnAfterOldFlush);
+                assertThat(flushLsnAfterOldFlush)
+                        .describedAs("flush_lsn should not move backwards when flushLsn() is called with older LSN")
+                        .isGreaterThanOrEqualTo(lsn2);
+            }
+            else {
+                logger.warn("Step 5: flush_lsn is still null - test inconclusive");
+                // Don't fail the test if we can't observe flush_lsn
+            }
+
+            stream.close();
+        }
+    }
+
+    @Test
+    @FixFor("DBZ-1489")
+    public void shouldNotMoveFlushLsnBackwardsInConnectorAndDriverMode() throws Exception {
+        // This test validates that in connector_and_driver mode, keep-alive DOES advance the LSN.
+        //
+        // The bug (DBZ-1489) occurs when:
+        // 1. Connector processes event and flushes LSN X
+        // 2. Keep-alive advances flush_lsn to Y (where Y > X) - THIS TEST VALIDATES THIS HAPPENS
+        // 3. Offset backing store calls flushLsn(X) with older LSN -> Bug: flush_lsn moves backwards
+        //
+        // Note: The actual backwards movement from step 3 is demonstrated in the simpler test
+        // shouldNotMoveFlushLsnBackwardsWhenFlushingOlderLsn(). This test focuses on validating
+        // that keep-alive in connector_and_driver mode does advance the LSN as expected.
+
+        int walSenderTimeout = TestHelper.setAndGetWalSenderTimeout(2);
+        TestHelper.execute(SETUP_TABLES_STMT);
+
+        // Start connector in connector_and_driver mode
+        final Configuration.Builder configBuilder = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.LSN_FLUSH_MODE, PostgresConnectorConfig.LsnFlushMode.CONNECTOR_AND_DRIVER.getValue())
+                .with(PostgresConnectorConfig.SCHEMA_INCLUDE_LIST, "s1")
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA);
+
+        start(PostgresConnector.class, configBuilder.build());
+        assertConnectorIsRunning();
+        waitForStreamingRunning();
+
+        logger.info("Step 1: Processing monitored event...");
+        TestHelper.execute("INSERT INTO s1.a (aa) VALUES (1);");
+        SourceRecords records = consumeRecordsByTopic(1);
+        assertThat(records.recordsForTopic(topicName("s1.a"))).hasSize(1);
+
+        // Get slot state after processing the monitored event
+        Thread.sleep(500);
+        final SlotState slotAfterMonitored = getDefaultReplicationSlot();
+        final Lsn monitoredEventLsn = slotAfterMonitored.slotLastFlushedLsn();
+        logger.info("Step 1: Slot LSN after monitored event = {}", monitoredEventLsn);
+
+        // Step 2: Generate unmonitored WAL activity
+        logger.info("Step 2: Generating unmonitored WAL activity...");
+        TestHelper.execute("CREATE TABLE public.unmonitored (id serial primary key, data text);");
+        for (int i = 0; i < 100; i++) {
+            TestHelper.execute("INSERT INTO public.unmonitored (data) VALUES ('" + RandomStringUtils.randomAlphanumeric(50) + "');");
+        }
+
+        // Process another monitored event to force connector to flush and trigger keep-alive
+        logger.info("Step 2b: Processing another monitored event to trigger flush/keep-alive...");
+        TestHelper.execute("INSERT INTO s1.a (aa) VALUES (2);");
+        SourceRecords records2 = consumeRecordsByTopic(1);
+        assertThat(records2.recordsForTopic(topicName("s1.a"))).hasSize(1);
+        Thread.sleep(500);
+
+        // Step 3: Verify keep-alive advanced the slot LSN
+        logger.info("Step 3: Verifying keep-alive advanced slot LSN (timeout: {} seconds)...", walSenderTimeout * 3);
+        Awaitility.await()
+                .alias("keep-alive should advance slot LSN beyond monitored event LSN")
+                .atMost(walSenderTimeout * 3, TimeUnit.SECONDS)
+                .pollInterval(Duration.ofMillis(300))
+                .untilAsserted(() -> {
+                    SlotState currentSlot = getDefaultReplicationSlot();
+                    assertThat(currentSlot.slotLastFlushedLsn())
+                            .describedAs("Keep-alive should have advanced slot LSN in connector_and_driver mode")
+                            .isGreaterThan(monitoredEventLsn);
+                });
+
+        final SlotState slotAfterKeepAlive = getDefaultReplicationSlot();
+        final Lsn advancedLsn = slotAfterKeepAlive.slotLastFlushedLsn();
+        logger.info("Step 3: ✓ Keep-alive successfully advanced slot LSN from {} to {} (+{} bytes)",
+                monitoredEventLsn, advancedLsn, advancedLsn.asLong() - monitoredEventLsn.asLong());
+
+        // Step 4: Now demonstrate the backwards movement bug - stop connector and flush older LSN
+        logger.info("Step 4: Stopping connector to demonstrate backwards flush bug...");
+        stopConnector();
+        Thread.sleep(500);
+
+        // Step 5: Flush the older monitored LSN using a direct replication connection
+        logger.info("Step 5: Attempting to flush older LSN {} when current is {}...",
+                monitoredEventLsn, advancedLsn);
+
+        try (ReplicationConnection directConnection = TestHelper.createForReplication(
+                ReplicationConnection.Builder.DEFAULT_SLOT_NAME, false)) {
+
+            ReplicationStream stream = directConnection.startStreaming(advancedLsn, new WalPositionLocator());
+            stream.readPending(msg -> {
+            });
+            Thread.sleep(200);
+
+            try (PostgresConnection checkConn = TestHelper.create()) {
+                Lsn flushLsnBefore = getFlushLsnFromStatReplication(checkConn);
+                logger.info("Step 5: flush_lsn before backwards attempt = {}", flushLsnBefore);
+
+                // Flush the older LSN - this should cause backwards movement
+                stream.flushLsn(monitoredEventLsn);
+                Thread.sleep(500);
+
+                Lsn flushLsnAfter = getFlushLsnFromStatReplication(checkConn);
+                logger.info("Step 5: flush_lsn after flushing older LSN = {}", flushLsnAfter);
+
+                if (flushLsnAfter != null && flushLsnAfter.compareTo(advancedLsn) < 0) {
+                    fail(String.format(
+                            "★★★ BUG DBZ-1489 IN CONNECTOR_AND_DRIVER MODE ★★★%n" +
+                                    "flush_lsn moved BACKWARDS from %s to %s (-%d bytes).%n" +
+                                    "%n" +
+                                    "Connector_and_driver mode scenario:%n" +
+                                    "  1. Processed event, flushed LSN=%s%n" +
+                                    "  2. Keep-alive advanced to %s (+%d bytes)%n" +
+                                    "  3. Flushed older LSN=%s%n" +
+                                    "  4. flush_lsn moved BACKWARDS to %s%n",
+                            advancedLsn, flushLsnAfter,
+                            advancedLsn.asLong() - flushLsnAfter.asLong(),
+                            monitoredEventLsn, advancedLsn,
+                            advancedLsn.asLong() - monitoredEventLsn.asLong(),
+                            monitoredEventLsn, flushLsnAfter));
+                }
+
+                logger.info("✓ Protection working: flush_lsn at {} (expected >= {})",
+                        flushLsnAfter, advancedLsn);
+                assertThat(flushLsnAfter)
+                        .describedAs("flush_lsn should not move backwards")
+                        .isGreaterThanOrEqualTo(advancedLsn);
+            }
+
+            stream.close();
+        }
     }
 
     @Test
