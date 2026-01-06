@@ -31,6 +31,7 @@ import java.util.stream.Collectors;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.postgresql.core.BaseConnection;
 import org.postgresql.core.ServerVersion;
+import org.postgresql.replication.LogSequenceNumber;
 import org.postgresql.replication.PGReplicationStream;
 import org.postgresql.replication.fluent.logical.ChainedLogicalStreamBuilder;
 import org.postgresql.util.PSQLException;
@@ -177,7 +178,7 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
     /**
      * Resets the statement_timeout to the specified value.
      *
-     * @param stmt the Statement to use for execution
+     * @param stmt            the Statement to use for execution
      * @param originalTimeout the timeout value to restore
      */
     private void resetStatementTimeout(Statement stmt, Optional<String> originalTimeout) {
@@ -195,7 +196,7 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
     /**
      * Executes a statement with a temporary statement_timeout, automatically restoring the original timeout afterwards.
      *
-     * @param stmt the Statement to use for execution
+     * @param stmt               the Statement to use for execution
      * @param statementToExecute the SQL statement to execute
      * @throws SQLException if the execution fails
      */
@@ -341,6 +342,7 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
      * Recovery mode typically occurs when the server is operating as a standby (replica) in a replication
      * setup or during crash recovery.
      * </p>
+     *
      * @return {@code true} if the database is in standby mode (read-only), {@code false} otherwise.
      * @throws SQLException if an error occurs while querying the database.
      */
@@ -991,10 +993,31 @@ public class PostgresReplicationConnection extends JdbcConnection implements Rep
             }
 
             private void doFlushLsn(Lsn lsn) throws SQLException {
-                stream.setFlushedLSN(lsn.asLogSequenceNumber());
-                stream.setAppliedLSN(lsn.asLogSequenceNumber());
+                LogSequenceNumber newLsn = lsn.asLogSequenceNumber();
 
-                stream.forceUpdateStatus();
+                if (advanceFlushedLSNIfNewer(newLsn) | updateAppliedLSNIfNewer(newLsn)) {
+                    stream.forceUpdateStatus();
+                }
+                else {
+                    LOGGER.debug("Skipping flush of LSN {} as current position is already at or ahead (flushed: {}, applied: {})",
+                            newLsn, stream.getLastFlushedLSN(), stream.getLastAppliedLSN());
+                }
+            }
+
+            private boolean advanceFlushedLSNIfNewer(LogSequenceNumber newLsn) {
+                if (stream.getLastFlushedLSN().compareTo(newLsn) < 0) {
+                    stream.setFlushedLSN(newLsn);
+                    return true;
+                }
+                return false;
+            }
+
+            private boolean updateAppliedLSNIfNewer(LogSequenceNumber newLsn) {
+                if (stream.getLastAppliedLSN().compareTo(newLsn) < 0) {
+                    stream.setAppliedLSN(newLsn);
+                    return true;
+                }
+                return false;
             }
 
             @Override
