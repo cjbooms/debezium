@@ -4572,7 +4572,7 @@ While the connector drains the stream, it confirms an LSN to the server only aft
 When the stream is quiet and all its records are delivered, the connector also confirms the commit LSN of the last delivered transaction.
 On PostgreSQL 17 and later, when all changes are confirmed before the server stops, `pg_upgrade` can migrate the replication slot.
 
-The drain ends, and the connector then fails with the original error, when one of the following occurs:
+The drain ends, and the connector then fails with a retriable error, when one of the following occurs:
 
 * All delivered changes are confirmed, and no new changes arrive during the interval that is set by xref:postgresql-property-status-update-interval-ms[`status.update.interval.ms`].
 * The replication stream ends.

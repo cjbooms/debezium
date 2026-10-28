@@ -20,6 +20,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 import org.apache.kafka.connect.errors.ConnectException;
 import org.postgresql.core.BaseConnection;
@@ -111,11 +112,10 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
     private Long lastXmin;
 
     private final Duration serverShutdownDrainTimeout;
-    private volatile Lsn lastFlushedLsn;
     private volatile RecordPosition lastCommittedRecord;
     private RecordPosition lastEmittedRecord;
     private SQLException drainCause;
-    private Threads.Timer drainTimer;
+    private Threads.TimeSince drainElapsed;
     private Thread drainWatchdog;
     private long lastDrainActivityMillis;
 
@@ -156,30 +156,54 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
         return !serverShutdownDrainTimeout.isZero();
     }
 
-    private boolean isDrainTimeoutInterrupt(Throwable failure) {
-        if (drainCause == null || !drainTimer.expired()) {
-            return false;
+    private boolean isDrainTimedOut() {
+        return drainElapsed.elapsedTime() >= serverShutdownDrainTimeout.toMillis();
+    }
+
+    /**
+     * Maps the interrupt of the drain watchdog to the error that started the drain, so that the failure stays retriable.
+     * Any other failure keeps its own type.
+     */
+    private Throwable drainFailure(Throwable failure) {
+        if (drainCause == null || !isDrainTimedOut()) {
+            return failure;
         }
-        // The dispatcher wraps the interrupt of a blocked enqueue in a ConnectException
-        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
-            if (cause instanceof InterruptedException) {
-                LOGGER.warn("The replication stream drain did not complete within {} ms; stopping streaming", serverShutdownDrainTimeout.toMillis());
-                return true;
-            }
+        LOGGER.warn("The replication stream drain did not complete within {} ms; stopping streaming", serverShutdownDrainTimeout.toMillis());
+        if (failure != drainCause) {
+            drainCause.addSuppressed(failure);
         }
-        return false;
+        return drainCause;
     }
 
     private void stopDrainWatchdog() {
-        final Thread watchdog = drainWatchdog;
-        if (watchdog == null) {
-            return;
+        if (drainWatchdog != null) {
+            stopWatchdog(drainWatchdog, this::isDrainTimedOut);
+            drainWatchdog = null;
         }
-        drainWatchdog = null;
+    }
+
+    /**
+     * Stops the watchdog and waits until it has terminated, so that it cannot interrupt the calling thread afterwards.
+     * A watchdog interrupt is cleared, so that the cleanup can close the connections. An interrupt from elsewhere is kept.
+     * The watchdog fires only when the drain has timed out.
+     */
+    static void stopWatchdog(Thread watchdog, BooleanSupplier drainTimedOut) {
         watchdog.interrupt();
-        if (drainTimer.expired()) {
-            // The watchdog might have interrupted this thread. Clear the flag so that the cleanup can close the replication connection.
+        boolean interrupted = false;
+        while (true) {
+            try {
+                watchdog.join();
+                break;
+            }
+            catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        if (drainTimedOut.getAsBoolean()) {
             Thread.interrupted();
+        }
+        else if (interrupted) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -218,10 +242,6 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
             throws InterruptedException {
 
         lsnFlushingAllowed = false;
-        drainCause = null;
-        drainTimer = null;
-        lastEmittedRecord = null;
-        lastCommittedRecord = null;
 
         // replication slot could exist at the time of starting Debezium, so we will stream from the position in the slot
         // instead of the last position in the database
@@ -278,12 +298,11 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
             processMessages(context, partition, this.effectiveOffset, stream);
         }
         catch (Throwable e) {
-            errorHandler.setProducerThrowable(isDrainTimeoutInterrupt(e) ? drainCause : e);
+            errorHandler.setProducerThrowable(drainFailure(e));
         }
         finally {
             stopDrainWatchdog();
-            // A drain must close the replication connection so that the walsender exits, also when the connector has no stored offset yet.
-            // The LSN flush failure path keeps passing null and leaves the connection open.
+            // After a drain, close the replication connection even without a stored offset, so that the walsender can exit.
             cleanUpStreamingOnStop(drainCause != null ? effectiveOffset : offsetContext);
         }
     }
@@ -366,12 +385,7 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
                 // the phase can stream event up to a specific lsn and the snapshot that occurs after the catch up
                 // streaming will not lose the current view of data. Since we need to hold the transaction open
                 // for the snapshot, this block must not commit during catch up streaming.
-                try {
-                    connection.commit();
-                }
-                catch (SQLException e) {
-                    startDrainOrThrow(e, offsetContext);
-                }
+                connection.commit();
             }
 
             if (context.isPaused()) {
@@ -444,7 +458,12 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
             else if (message.getOperation() == Operation.COMMIT) {
                 offsetContext.resetLsnEventsProcessed();
                 commitMessage(partition, offsetContext, lsn);
+                // The END event carries this commit LSN, so the drain must not confirm it before the event is delivered
+                final boolean emitsTransactionEnd = isServerShutdownDrainEnabled() && offsetContext.getTransactionContext().isTransactionInProgress();
                 dispatcher.dispatchTransactionCommittedEvent(partition, offsetContext, message.getCommitTime());
+                if (emitsTransactionEnd) {
+                    lastEmittedRecord = RecordPosition.of(offsetContext);
+                }
             }
             maybeWarnAboutGrowingWalBacklog(true);
         }
@@ -565,12 +584,14 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
                 + "Continuing to read the replication stream for up to {} ms so that delivered changes can be confirmed before the server shuts down.",
                 e.getMessage(), serverShutdownDrainTimeout.toMillis());
         drainCause = e;
-        drainTimer = Threads.timer(clock, serverShutdownDrainTimeout);
+        drainElapsed = Threads.timeSince(clock);
+        drainElapsed.reset();
         lastDrainActivityMillis = clock.currentTimeInMillis();
-        // Dispatching blocks while the queue is full, so the timer check in the loop might never run.
-        // The watchdog interrupts the streaming thread when the timeout expires.
-        drainWatchdog = Threads.interruptAfterTimeout("server-shutdown-drain", serverShutdownDrainTimeout.toMillis(), TimeUnit.MILLISECONDS,
-                Threads.timeSince(clock));
+        // Dispatching blocks while the queue is full, so the timeout check in the loop might never run.
+        // The watchdog interrupts the streaming thread when the timeout expires. Only this thread resets drainElapsed.
+        final Thread streamingThread = Thread.currentThread();
+        drainWatchdog = Threads.timeout("server-shutdown-drain", serverShutdownDrainTimeout.toMillis(), TimeUnit.MILLISECONDS,
+                100, TimeUnit.MILLISECONDS, drainElapsed::elapsedTime, null, streamingThread::interrupt);
         drainWatchdog.setDaemon(true);
         drainWatchdog.start();
     }
@@ -580,18 +601,11 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
         if (receivedMessage) {
             lastDrainActivityMillis = now;
         }
-        if (drainTimer.expired()) {
-            LOGGER.warn("The replication stream drain did not complete within {} ms; stopping streaming", serverShutdownDrainTimeout.toMillis());
+        if (isDrainTimedOut()) {
             throw drainCause;
         }
         if (now - lastDrainActivityMillis < connectorConfig.statusUpdateInterval().toMillis()) {
             return;
-        }
-        final Lsn commitLsn = offsetContext.lastCommitLsn();
-        final Lsn flushed = lastFlushedLsn;
-        if (commitLsn == null || (flushed != null && flushed.compareTo(commitLsn) >= 0)) {
-            LOGGER.info("The replication stream is drained; changes up to LSN '{}' are confirmed to the server", flushed);
-            throw drainCause;
         }
         final RecordPosition emitted = lastEmittedRecord;
         final RecordPosition committed = lastCommittedRecord;
@@ -599,12 +613,13 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
             // The engine has not yet committed every emitted record
             return;
         }
-        final ReplicationStream stream = replicationStream.get();
-        if (stream == null) {
-            throw drainCause;
+        final Lsn commitLsn = offsetContext.lastCommitLsn();
+        if (commitLsn != null) {
+            // Data records carry the previous transaction's commit LSN, so offset commits stop one transaction short.
+            // Confirm the last processed commit through the regular flush path.
+            commitOffset(Map.of(), Map.of(PostgresOffsetContext.LAST_COMMIT_LSN_KEY, commitLsn.asLong()));
+            LOGGER.info("The replication stream is drained; confirming commit LSN '{}' to the server", commitLsn);
         }
-        flushLsnToServer(stream, commitLsn);
-        LOGGER.info("The replication stream is drained; confirmed commit LSN '{}' to the server", commitLsn);
         throw drainCause;
     }
 
@@ -668,67 +683,55 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
                 return;
             }
 
-            flushLsnToServer(replicationStream, lsn);
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("Flushing LSN to server: {}", lsn);
+            }
+            // tell the server the point up to which we've processed data, so it can be free to recycle WAL segments
+            Future<Void> future = null;
+            try {
+                future = lsnFlushExecutor.submit(() -> {
+                    try {
+                        replicationStream.flushLsn(lsn);
+                        return null;
+                    }
+                    catch (SQLException e) {
+                        commitOffsetFailure = true;
+                        cleanUpStreamingOnStop(null);
+                        throw new ConnectException(e);
+                    }
+                });
+
+                future.get(connectorConfig.lsnFlushTimeout().toMillis(), TimeUnit.MILLISECONDS);
+            }
+            catch (TimeoutException e) {
+                future.cancel(true);
+                // Handle the timeout according to configuration
+                handleTimeout(lsn);
+            }
+            catch (InterruptedException e) {
+                future.cancel(true);
+                Thread.currentThread().interrupt();
+                LOGGER.warn("LSN flush operation for '{}' was interrupted. Continuing without waiting for flush completion.", lsn);
+            }
+            catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof ConnectException) {
+                    throw (ConnectException) cause;
+                }
+                throw new ConnectException("LSN flush operation failed", cause);
+            }
+            catch (RejectedExecutionException e) {
+                if (isClosing) {
+                    LOGGER.debug("LSN flush rejected due to connector shutdown, ignoring");
+                }
+                else {
+                    LOGGER.error("LSN flush operation was rejected by executor");
+                    throw new ConnectException("LSN flush operation rejected by executor", e);
+                }
+            }
         }
         else {
             LOGGER.debug("Streaming has already stopped, ignoring commit callback...");
-        }
-    }
-
-    private void flushLsnToServer(ReplicationStream replicationStream, Lsn lsn) {
-        if (LOGGER.isDebugEnabled()) {
-            LOGGER.debug("Flushing LSN to server: {}", lsn);
-        }
-        // tell the server the point up to which we've processed data, so it can be free to recycle WAL segments
-        Future<Void> future = null;
-        try {
-            future = lsnFlushExecutor.submit(() -> {
-                try {
-                    replicationStream.flushLsn(lsn);
-                    recordFlushedLsn(lsn);
-                    return null;
-                }
-                catch (SQLException e) {
-                    commitOffsetFailure = true;
-                    cleanUpStreamingOnStop(null);
-                    throw new ConnectException(e);
-                }
-            });
-
-            future.get(connectorConfig.lsnFlushTimeout().toMillis(), TimeUnit.MILLISECONDS);
-        }
-        catch (TimeoutException e) {
-            future.cancel(true);
-            // Handle the timeout according to configuration
-            handleTimeout(lsn);
-        }
-        catch (InterruptedException e) {
-            future.cancel(true);
-            Thread.currentThread().interrupt();
-            LOGGER.warn("LSN flush operation for '{}' was interrupted. Continuing without waiting for flush completion.", lsn);
-        }
-        catch (ExecutionException e) {
-            Throwable cause = e.getCause();
-            if (cause instanceof ConnectException) {
-                throw (ConnectException) cause;
-            }
-            throw new ConnectException("LSN flush operation failed", cause);
-        }
-        catch (RejectedExecutionException e) {
-            if (isClosing) {
-                LOGGER.debug("LSN flush rejected due to connector shutdown, ignoring");
-            }
-            else {
-                LOGGER.error("LSN flush operation was rejected by executor");
-                throw new ConnectException("LSN flush operation rejected by executor", e);
-            }
-        }
-    }
-
-    private void recordFlushedLsn(Lsn lsn) {
-        final Lsn previous = lastFlushedLsn;
-        if (previous == null || lsn.compareTo(previous) > 0) {
-            lastFlushedLsn = lsn;
         }
     }
 
